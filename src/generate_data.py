@@ -53,9 +53,30 @@ def _user_table(rng: np.random.Generator) -> pd.DataFrame:
     )
 
 
-def _session_count(loyalty: np.ndarray, rng: np.random.Generator) -> np.ndarray:
-    lam = 1.2 + loyalty * 5.5
-    return rng.poisson(lam).clip(1, 14)
+MAX_SESSIONS = 14
+MEAN_GAP_DAYS = 5.0
+
+
+def _visit_days(loyalty: float, span: int, rng: np.random.Generator) -> list[int]:
+    """Day offsets of a user's visits: first visit on day 0, then churn or return.
+
+    After each visit the user comes back with probability `p_return`, after an
+    exponential gap. A constant churn hazard gives the realistic decaying
+    retention curve.
+
+    The previous version drew k uniform days, sorted them and overwrote the
+    smallest with 0. That keeps only the *largest* k-1 draws, skewing visits
+    to the end of the window, so retention grew with week number.
+    """
+    p_return = min(0.92, 0.45 + 0.6 * loyalty)
+    days = [0]
+    day = 0.0
+    while len(days) < MAX_SESSIONS and rng.random() < p_return:
+        day += 1 + rng.exponential(MEAN_GAP_DAYS)
+        if day > span:
+            break
+        days.append(int(day))
+    return days
 
 
 def _funnel_p(channel: str, device: str, category: str) -> dict[str, float]:
@@ -86,17 +107,13 @@ def _funnel_p(channel: str, device: str, category: str) -> dict[str, float]:
 
 
 def _events(users: pd.DataFrame, rng: np.random.Generator) -> tuple[pd.DataFrame, pd.DataFrame]:
-    n_sess = _session_count(users["loyalty"].to_numpy(), rng)
     rows_s: list[dict] = []
     rows_e: list[dict] = []
     sid = 1
     eid = 1
-    for i, u in enumerate(users.itertuples(index=False)):
-        k = int(n_sess[i])
+    for u in users.itertuples(index=False):
         span = max(1, (END - u.first_seen).days)
-        offsets = np.sort(rng.integers(0, span + 1, k))
-        offsets[0] = 0
-        for day_off in offsets:
+        for day_off in _visit_days(float(u.loyalty), span, rng):
             ts = u.first_seen + pd.Timedelta(days=int(day_off), hours=int(rng.integers(8, 23)), minutes=int(rng.integers(0, 60)))
             if ts > END:
                 continue
@@ -104,7 +121,7 @@ def _events(users: pd.DataFrame, rng: np.random.Generator) -> tuple[pd.DataFrame
             channel = u.acq_channel if rng.random() < 0.7 else rng.choice(CHANNELS, p=CHANNEL_P)
             category = rng.choice(CATEGORIES, p=CATEGORY_P)
             p = _funnel_p(channel, device, category)
-            weekend = ts.dayofweek >= 5
+            weekend = ts.day_of_week >= 5
             if weekend and device == "desktop":
                 p["pay"] = min(0.95, p["pay"] * 1.06)
 
